@@ -8,10 +8,12 @@ EC-CUBE で稼働していた `WisdomGuildBatchCommand`（毎日 3:00 cron）の
 
 ```
 GitHub Actions (毎日 JST 3:00)
-  → Shopify Admin API で商品取得
-  → Wisdom Guild 形式のテキストファイル生成
+  → Shopify Admin API の Bulk Operation で商品データ一括取得（JSONL）
+  → ローカルで Wisdom Guild 形式のテキストファイル生成
   → GitHub Pages にデプロイ・公開
 ```
+
+通常 GraphQL の pagination は 25,000 オブジェクト上限のため、本ストア規模（数十万バリエーション）では **Bulk Operation API が必須**。
 
 ## 出力フォーマット
 
@@ -133,10 +135,12 @@ Actions タブ > 「Wisdom Guild Feed Generation」 > 「Run workflow」
 
 - **スケジュール実行**: 毎日 JST 3:00（`cron: '0 18 * * *'` UTC）。GitHub Actions の cron は数分〜数十分の遅延が発生し得る。
 - **API バージョン**: `2025-01` をハードコード。Shopify の四半期リリースに合わせて定期更新が必要。
+- **取得方式**: `bulkOperationRunQuery` で全商品を一括クエリし、`currentBulkOperation` を 10 秒間隔でポーリング。完了後に署名付き URL（GCS 等）から JSONL をストリームダウンロードして商品とバリアントを `__parentId` で紐づける。Bulk はソート不可のため、取得後にメモリ上で `updatedAt` 降順ソートする。
+- **タイムアウト**: Bulk Operation の完了待ちは既定 60 分。`BULK_TIMEOUT_MS` で上書き可能。
+- **既存の Bulk Operation との競合**: 同一ストアで Bulk は同時 1 本のみ。既に実行中の場合は完了を待ってから新規発行する。
 - **レートリミット / リトライ**:
   - GraphQL の `extensions.cost.throttleStatus` を監視し、残量が少ない場合は自動待機。
   - HTTP 429 / 5xx、ネットワーク失敗、GraphQL `THROTTLED` には指数バックオフ付きでリトライ（最大 5 回）。`Retry-After` ヘッダーがあれば優先する。
-- **バリアント取得**: `variants(first: 100)` で取り切れない商品は `productVariants` クエリで追加ページングする。
+- **JSONL ダウンロード**: Bulk が返す URL は署名付きの直接ダウンロード URL のため、Shopify の認証ヘッダは付けない（付けると失敗する）。
 - **`SHOPIFY_STORE_URL`** に `https://` や末尾スラッシュが含まれていても自動で除去する。形式が `*.myshopify.com` でない場合は警告を出す。
 - **失敗通知**: 標準では未設定（運用判断で見送り）。必要に応じて GitHub Actions の通知や Slack 連携を追加する。
-- **商品規模が大きい場合**: 通常 GraphQL の pagination は 25,000 オブジェクト上限があるため、十数万件規模では Bulk Operation API への切替が必要。
