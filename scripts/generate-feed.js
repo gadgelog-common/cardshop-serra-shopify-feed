@@ -26,19 +26,39 @@ const SHOPIFY_STORE_URL = normalizeStoreUrl(requiredEnv("SHOPIFY_STORE_URL"));
 const SHOPIFY_ACCESS_TOKEN = requiredEnv("SHOPIFY_ACCESS_TOKEN");
 
 // 対象商品フィルタ用メタフィールド（既定: custom.wisdomguild = true）
-const FILTER_METAFIELD_NAMESPACE =
-  process.env.FILTER_METAFIELD_NAMESPACE || "custom";
-const FILTER_METAFIELD_KEY = process.env.FILTER_METAFIELD_KEY || "wisdomguild";
+const FILTER_METAFIELD_NAMESPACE = validateMetafieldIdentifier(
+  "FILTER_METAFIELD_NAMESPACE",
+  process.env.FILTER_METAFIELD_NAMESPACE || "custom"
+);
+const FILTER_METAFIELD_KEY = validateMetafieldIdentifier(
+  "FILTER_METAFIELD_KEY",
+  process.env.FILTER_METAFIELD_KEY || "wisdomguild"
+);
 
 // 商品コードのソース:
 //   - "variant_sku" (default): variant.sku を商品コードとして出力
 //   - "product_metafield":     商品メタフィールド値を商品コードとして出力（同一商品の全行で同値）
 const ITEMCODE_SOURCE = process.env.ITEMCODE_SOURCE || "variant_sku";
-const ITEMCODE_METAFIELD_NAMESPACE =
-  process.env.ITEMCODE_METAFIELD_NAMESPACE || "custom";
-const ITEMCODE_METAFIELD_KEY =
-  process.env.ITEMCODE_METAFIELD_KEY || "itemcode";
+const ITEMCODE_METAFIELD_NAMESPACE = validateMetafieldIdentifier(
+  "ITEMCODE_METAFIELD_NAMESPACE",
+  process.env.ITEMCODE_METAFIELD_NAMESPACE || "custom"
+);
+const ITEMCODE_METAFIELD_KEY = validateMetafieldIdentifier(
+  "ITEMCODE_METAFIELD_KEY",
+  process.env.ITEMCODE_METAFIELD_KEY || "itemcode"
+);
 
+// 販売可能性の厳密フィルタ（既定: 無効）
+//   true:  inventoryItem.tracked && availableForSale の両方を要求
+//   false: inventoryItem.tracked のみで判定（在庫0でもバックオーダー無効でも出力）
+// 元バッチは ProductClass.isVisible() のみで在庫0行も出力していたため、既定は false。
+// 「Wisdom Guild には販売可能なものだけを渡す」運用に切り替えるなら true にする。
+const STRICT_AVAILABILITY = process.env.STRICT_AVAILABILITY === "true";
+
+// Shopify Admin API のバージョン。
+// Shopify は四半期ごとに API バージョンをリリースし、約 12ヶ月後にサポート終了する。
+// 年 1 回程度はリリースカレンダーを確認し、本定数の値を更新する運用が必要。
+//   https://shopify.dev/docs/api/usage/versioning
 const SHOPIFY_API_VERSION = "2025-01";
 const GRAPHQL_ENDPOINT = `https://${SHOPIFY_STORE_URL}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
 
@@ -56,16 +76,18 @@ const BULK_TIMEOUT_MS = Number(process.env.BULK_TIMEOUT_MS) || 60 * 60 * 1000;
 //   - Bulk クエリでは first/last/after/before/sortKey などの connection arg は使用不可
 //   - ネストしたコネクション（variants など）は別行で出力され __parentId で紐づく
 //   - スカラ型のリスト（selectedOptions）はバリアント行内に inline で含まれる
+//   - 文字列リテラルへの埋め込みは JSON.stringify を経由してエスケープ漏れを防ぐ
+//     （namespace/key は startup で validate 済みだが defense-in-depth）
 
 const BULK_QUERY = `
   {
-    products(query: "${buildBulkProductFilter()}") {
+    products(query: ${JSON.stringify(buildBulkProductFilter())}) {
       edges {
         node {
           id
           title
           updatedAt
-          itemCodeMetafield: metafield(namespace: "${ITEMCODE_METAFIELD_NAMESPACE}", key: "${ITEMCODE_METAFIELD_KEY}") {
+          itemCodeMetafield: metafield(namespace: ${JSON.stringify(ITEMCODE_METAFIELD_NAMESPACE)}, key: ${JSON.stringify(ITEMCODE_METAFIELD_KEY)}) {
             value
           }
           variants {
@@ -134,7 +156,7 @@ async function main() {
   const operation = await startBulkOperation();
   console.log(`[INFO] Bulk Operation 開始: ${operation.id}`);
 
-  const completed = await pollBulkOperation();
+  const completed = await pollBulkOperation(operation.id);
   console.log(
     `[INFO] Bulk Operation 完了: objectCount=${completed.objectCount}, fileSize=${completed.fileSize}`
   );
@@ -152,14 +174,28 @@ async function main() {
     process.exit(1);
   }
 
-  // 元仕様の update_date DESC と整合させる（Bulk はソート不可のためメモリ上でソート）
-  products.sort((a, b) => {
-    const ta = Date.parse(a.updatedAt);
-    const tb = Date.parse(b.updatedAt);
-    return tb - ta;
+  // 元仕様の update_date DESC と整合させる（Bulk はソート不可のためメモリ上でソート）。
+  // updatedAt が不正な商品は末尾に固定し、警告ログを出す。
+  // 不正件数は sort 比較関数では正しく数えられないため、事前に Date.parse の結果をキャッシュする。
+  const productSortKeys = products.map((p) => Date.parse(p.updatedAt));
+  const invalidDateCount = productSortKeys.filter((t) => Number.isNaN(t)).length;
+  if (invalidDateCount > 0) {
+    console.warn(
+      `[WARN] updatedAt が不正な商品が ${invalidDateCount} 件ありました（末尾固定）`
+    );
+  }
+  const productsWithKey = products.map((p, i) => ({ p, t: productSortKeys[i] }));
+  productsWithKey.sort((a, b) => {
+    const aInvalid = Number.isNaN(a.t);
+    const bInvalid = Number.isNaN(b.t);
+    if (aInvalid && bInvalid) return 0;
+    if (aInvalid) return 1;
+    if (bInvalid) return -1;
+    return b.t - a.t;
   });
+  const sortedProducts = productsWithKey.map((x) => x.p);
 
-  const lines = generateFeedLines(products);
+  const lines = generateFeedLines(sortedProducts);
   console.log(`[INFO] 出力行数（バリエーション数）: ${lines.length}`);
 
   mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -187,7 +223,8 @@ async function startBulkOperation() {
     );
     if (inProgress) {
       console.warn("[WARN] 既存の Bulk Operation が実行中。完了を待機して再試行します");
-      await pollBulkOperation();
+      // 既存 op の id は不明なので expectedId なしでポーリング
+      await pollBulkOperation(null);
       const retry = await runBulkOperationRunQuery();
       if ((retry.userErrors ?? []).length > 0) {
         throw new Error(
@@ -207,7 +244,7 @@ async function runBulkOperationRunQuery() {
   return data.bulkOperationRunQuery;
 }
 
-async function pollBulkOperation() {
+async function pollBulkOperation(expectedId) {
   const startedAt = Date.now();
   while (true) {
     if (Date.now() - startedAt > BULK_TIMEOUT_MS) {
@@ -220,6 +257,12 @@ async function pollBulkOperation() {
     const op = data.currentBulkOperation;
     if (!op) {
       throw new Error("currentBulkOperation が null です");
+    }
+
+    if (expectedId && op.id !== expectedId) {
+      throw new Error(
+        `currentBulkOperation.id ${op.id} が期待値 ${expectedId} と一致しません。別の Bulk Operation が割り込んだ可能性があります`
+      );
     }
 
     console.log(
@@ -249,7 +292,7 @@ async function pollBulkOperation() {
 // --- JSONL ダウンロードとパース ---
 
 async function downloadAndParseJsonl(url) {
-  console.log(`[INFO] JSONL をダウンロード中...`);
+  console.log(`[INFO] JSONL をダウンロード中: ${safeUrl(url)}`);
   // Bulk の url は GCS 等の署名付きで、Shopify 認証ヘッダは不要（むしろ付けると失敗する）
   const response = await fetchWithRetry(url, { method: "GET" });
 
@@ -267,6 +310,7 @@ async function downloadAndParseJsonl(url) {
   const orphanVariants = [];
 
   let processedLines = 0;
+  let parseErrors = 0;
 
   const processLine = (line) => {
     if (line.length === 0) return;
@@ -274,7 +318,12 @@ async function downloadAndParseJsonl(url) {
     try {
       obj = JSON.parse(line);
     } catch (err) {
-      console.warn(`[WARN] JSONL パース失敗（スキップ）: ${err.message}`);
+      parseErrors++;
+      // 行頭だけログに出して全文ログ汚染を避ける
+      const head = line.slice(0, 80).replace(/\s+/g, " ");
+      console.warn(
+        `[WARN] JSONL パース失敗 (#${parseErrors}): ${err.message} -- "${head}..."`
+      );
       return;
     }
 
@@ -318,12 +367,30 @@ async function downloadAndParseJsonl(url) {
   }
 
   // orphan を再紐づけ（親が後ろに来た場合に備える）
+  let unresolvedOrphans = 0;
   for (const v of orphanVariants) {
     const parent = products.get(v.__parentId);
-    if (parent) parent.variants.push(toVariant(v));
+    if (parent) {
+      parent.variants.push(toVariant(v));
+    } else {
+      unresolvedOrphans++;
+    }
   }
 
   console.log(`[INFO] JSONL 処理行数: ${processedLines}`);
+
+  // 不整合は黙って公開せず失敗扱いにする（壊れたフィードを成功扱いにしない）
+  if (parseErrors > 0) {
+    throw new Error(
+      `JSONL parse error が ${parseErrors} 件発生しました（フィード生成を中止）`
+    );
+  }
+  if (unresolvedOrphans > 0) {
+    throw new Error(
+      `親商品が見つからない variant が ${unresolvedOrphans} 件あります（フィード生成を中止）`
+    );
+  }
+
   return Array.from(products.values());
 }
 
@@ -352,13 +419,12 @@ function generateFeedLines(products) {
 
     for (const variant of product.variants) {
       // EC-CUBE の ProductClass.isVisible() 相当の代替フィルタ:
-      //   - inventoryItem.tracked === true: 在庫追跡 OFF のバリアントを除外
-      //   - availableForSale === true:      販売可能なバリアントのみ
-      // 注意: availableForSale は「在庫切れ + バックオーダー無効」のバリアントを除外する。
-      //   元仕様は在庫0でも出力していたため、Wisdom Guild 側で在庫切れ表示が必要なら
-      //   availableForSale 条件を緩める（在庫追跡 ON のみで通す）ことを検討。
+      //   - inventoryItem.tracked === true: 在庫追跡 OFF のバリアントを除外（既定）
+      //   - availableForSale === true:      販売可能なバリアントのみ（STRICT_AVAILABILITY=true 時）
+      // 元バッチは isVisible() のみで在庫0行も出力していたため availableForSale は opt-in。
+      // 在庫切れ行も Wisdom Guild に渡したい運用が既定。
       if (variant.inventoryItem?.tracked !== true) continue;
-      if (variant.availableForSale !== true) continue;
+      if (STRICT_AVAILABILITY && variant.availableForSale !== true) continue;
 
       const name = sanitizeField(buildProductName(product.title, variant));
       const itemCode = sanitizeField(
@@ -481,8 +547,10 @@ async function fetchWithRetry(url, options) {
       }
 
       if (!response.ok) {
+        // Bulk JSONL 用の署名付き URL は query string に一時認可情報を含むため、
+        // ログ・例外メッセージには含めず origin+pathname だけを残す。
         throw new Error(
-          `HTTP error: ${response.status} ${response.statusText} (${url})`
+          `HTTP error: ${response.status} ${response.statusText} (${safeUrl(url)})`
         );
       }
 
@@ -532,6 +600,29 @@ function normalizeStoreUrl(url) {
     );
   }
   return normalized;
+}
+
+function validateMetafieldIdentifier(name, value) {
+  // Shopify のメタフィールド namespace/key は [A-Za-z0-9_-] の範囲に限定。
+  // GraphQL 文字列リテラルへの埋め込みを安全にするため、起動時に検証する。
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) {
+    console.error(
+      `[ERROR] 環境変数 ${name} の値 "${value}" が不正です。[A-Za-z0-9_-] のみ許可されます`
+    );
+    process.exit(1);
+  }
+  return value;
+}
+
+function safeUrl(url) {
+  // 署名付き URL の query string は一時的な認可情報を含むため、
+  // ログ・例外メッセージには query を含めない origin+pathname を返す。
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return "(invalid url)";
+  }
 }
 
 function requiredEnv(name) {

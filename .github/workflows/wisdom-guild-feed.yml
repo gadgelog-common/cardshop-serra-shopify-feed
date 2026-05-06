@@ -45,6 +45,7 @@ jobs:
           ITEMCODE_SOURCE: ${{ vars.ITEMCODE_SOURCE || 'variant_sku' }}
           ITEMCODE_METAFIELD_NAMESPACE: ${{ vars.ITEMCODE_METAFIELD_NAMESPACE || 'custom' }}
           ITEMCODE_METAFIELD_KEY: ${{ vars.ITEMCODE_METAFIELD_KEY || 'itemcode' }}
+          STRICT_AVAILABILITY: ${{ vars.STRICT_AVAILABILITY || 'false' }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

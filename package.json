@@ -5,9 +5,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "generate": "node scripts/generate-feed.js"
+    "generate": "node --env-file=.env scripts/generate-feed.js"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.6.0"
   }
 }

@@ -36,12 +36,14 @@ GitHub Actions (毎日 JST 3:00)
 
 ### バリアント抽出条件
 
-EC-CUBE 移行元の `ProductClass.isVisible()` 相当のフィルタとして、以下を AND で適用:
+EC-CUBE 移行元の `ProductClass.isVisible()` 相当のフィルタ:
 
-- `inventoryItem.tracked === true` — 在庫追跡 OFF のバリアントを除外
-- `availableForSale === true` — 販売可能なバリアントのみ
+| 条件 | 既定 | 備考 |
+|---|---|---|
+| `inventoryItem.tracked === true` | 常に適用 | 在庫追跡 OFF のバリアントを除外 |
+| `availableForSale === true` | `STRICT_AVAILABILITY=true` 時のみ | 在庫切れ + バックオーダー無効のバリアントを除外 |
 
-> **運用上の注意**: `availableForSale` は「在庫切れ + バックオーダー無効」のバリアントを除外する。Wisdom Guild 側で在庫切れ表示が必要な場合、`scripts/generate-feed.js` の該当フィルタを緩める（在庫追跡 ON のみで通す）必要がある。
+既定では `tracked` のみで判定し、**在庫0行も出力する**（元バッチ仕様と一致）。Wisdom Guild には販売可能なものだけを渡したい運用に切り替える場合は `STRICT_AVAILABILITY=true` に設定する。
 
 ### フィールド値のサニタイズ
 
@@ -99,6 +101,9 @@ namespace / key は環境変数 `FILTER_METAFIELD_NAMESPACE` / `FILTER_METAFIELD
 | `ITEMCODE_SOURCE` | `variant_sku` | 商品コードのソース。`variant_sku` または `product_metafield` |
 | `ITEMCODE_METAFIELD_NAMESPACE` | `custom` | `ITEMCODE_SOURCE=product_metafield` 時の namespace |
 | `ITEMCODE_METAFIELD_KEY` | `itemcode` | `ITEMCODE_SOURCE=product_metafield` 時の key |
+| `STRICT_AVAILABILITY` | `false` | `true` で `availableForSale === true` も併用（在庫切れ行を除外）|
+
+> **メタフィールド識別子の検証**: namespace / key は起動時に `[A-Za-z0-9_-]+` で validate される。範囲外の値が設定されているとスクリプトはエラーで終了する。
 
 > **商品コードの選択**: 移行元 EC-CUBE の `Product.itemCode` は商品単位コードのため、Wisdom Guild 側が商品単位コードを期待している場合は `ITEMCODE_SOURCE=product_metafield` に切り替え、商品メタフィールド `custom.itemcode` に旧 itemCode を保持する運用とする。バリアント単位の SKU で問題なければ既定の `variant_sku` のまま。
 
@@ -119,13 +124,15 @@ https://<owner>.github.io/<repository>/wisdom_guild_products.txt
 
 ## ローカル実行
 
+Node.js **20.6.0 以上**が必要（`--env-file` フラグを利用するため）。
+
 ```bash
 cp .env.example .env
 # .env を編集して実際の値を設定
 npm run generate
 ```
 
-出力は `output/wisdom_guild_products.txt` に書き出される。
+`npm run generate` は内部で `node --env-file=.env scripts/generate-feed.js` を実行する。出力は `output/wisdom_guild_products.txt` に書き出される。
 
 ## 手動実行（GitHub Actions）
 
@@ -134,13 +141,26 @@ Actions タブ > 「Wisdom Guild Feed Generation」 > 「Run workflow」
 ## 運用メモ
 
 - **スケジュール実行**: 毎日 JST 3:00（`cron: '0 18 * * *'` UTC）。GitHub Actions の cron は数分〜数十分の遅延が発生し得る。
-- **API バージョン**: `2025-01` をハードコード。Shopify の四半期リリースに合わせて定期更新が必要。
-- **取得方式**: `bulkOperationRunQuery` で全商品を一括クエリし、`currentBulkOperation` を 10 秒間隔でポーリング。完了後に署名付き URL（GCS 等）から JSONL をストリームダウンロードして商品とバリアントを `__parentId` で紐づける。Bulk はソート不可のため、取得後にメモリ上で `updatedAt` 降順ソートする。
+- **API バージョン**: `scripts/generate-feed.js` の `SHOPIFY_API_VERSION` 定数で固定。Shopify は四半期ごとに API バージョンをリリースし約 12ヶ月後にサポート終了するため、**年 1 回程度**は [リリースカレンダー](https://shopify.dev/docs/api/usage/versioning) を確認して値を更新すること。サポート切れになると Bulk / GraphQL のフィールドが突然失敗することがある。
+- **取得方式**: `bulkOperationRunQuery` で全商品を一括クエリし、`currentBulkOperation` を 10 秒間隔でポーリング。完了後に署名付き URL（GCS 等）から JSONL をストリームダウンロードして商品とバリアントを `__parentId` で紐づける。Bulk はソート不可のため、取得後にメモリ上で `updatedAt` 降順ソートする。`updatedAt` が不正な値の商品は末尾に固定し警告を出す。
 - **タイムアウト**: Bulk Operation の完了待ちは既定 60 分。`BULK_TIMEOUT_MS` で上書き可能。
-- **既存の Bulk Operation との競合**: 同一ストアで Bulk は同時 1 本のみ。既に実行中の場合は完了を待ってから新規発行する。
+- **既存の Bulk Operation との競合**: 同一ストアで Bulk は同時 1 本のみ。既に実行中の場合は完了を待ってから新規発行する。発行した operation の id は `pollBulkOperation()` で照合し、別の Bulk が割り込んだ場合はエラーで停止する。
+- **データ整合性**: JSONL の parse 失敗 や `__parentId` で親が見つからない variant が **1 件でも**あれば、フィード生成を中止して失敗扱いにする（壊れたフィードを公開するより停止して検知する方針）。
 - **レートリミット / リトライ**:
   - GraphQL の `extensions.cost.throttleStatus` を監視し、残量が少ない場合は自動待機。
   - HTTP 429 / 5xx、ネットワーク失敗、GraphQL `THROTTLED` には指数バックオフ付きでリトライ（最大 5 回）。`Retry-After` ヘッダーがあれば優先する。
-- **JSONL ダウンロード**: Bulk が返す URL は署名付きの直接ダウンロード URL のため、Shopify の認証ヘッダは付けない（付けると失敗する）。
+- **JSONL ダウンロード**: Bulk が返す URL は署名付きの直接ダウンロード URL のため、Shopify の認証ヘッダは付けない（付けると失敗する）。署名付き URL の query string は一時的な認可情報を含むため、ログ・例外メッセージには含めない。
 - **`SHOPIFY_STORE_URL`** に `https://` や末尾スラッシュが含まれていても自動で除去する。形式が `*.myshopify.com` でない場合は警告を出す。
-- **失敗通知**: 標準では未設定（運用判断で見送り）。必要に応じて GitHub Actions の通知や Slack 連携を追加する。
+- **メタフィールド識別子**: 起動時に `[A-Za-z0-9_-]+` で validate。範囲外なら起動失敗。
+
+## 帯域・配信
+
+- 元バッチの出力ファイルは **142MB**（24 万バリエーション規模）。日次取得を前提とした場合の見積もり:
+
+  | 取得頻度 | 月間転送量 | GitHub Pages 100GB/月 上限に対する割合 |
+  |---|---|---|
+  | 日次 | 約 4.3GB | 約 4% |
+  | 時間ごと | 約 102GB | **上限到達** |
+
+- Wisdom Guild 側の取得頻度を **必ず確認**し、時間単位の取得が想定されるなら GitHub Pages 以外の配信先（Cloudflare R2 / S3 + CloudFront 等）への切替を検討する。
+- 失敗通知は未設定。Repository の Settings > Notifications で **Actions failure 通知の受信者**を明確にしておくこと（古い Pages ファイルが残る構成のため、外部からは異常を検知しづらい）。
