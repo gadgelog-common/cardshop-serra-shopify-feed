@@ -1,0 +1,59 @@
+name: Wisdom Guild Feed Generation
+
+on:
+  schedule:
+    # 毎日 JST 3:00 (UTC 18:00) に実行
+    - cron: "0 18 * * *"
+  # 手動実行も可能
+  workflow_dispatch:
+
+# GitHub Pages デプロイに必要な権限
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同時実行を防止（このワークフロー単位でグループ化し、他の Pages workflow と直列化されないようにする）
+concurrency:
+  group: "${{ github.workflow }}-pages"
+  cancel-in-progress: false
+
+jobs:
+  generate-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Generate Wisdom Guild feed
+        run: node scripts/generate-feed.js
+        env:
+          TZ: Asia/Tokyo
+          SHOPIFY_STORE_URL: ${{ secrets.SHOPIFY_STORE_URL }}
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          FILTER_METAFIELD_NAMESPACE: ${{ vars.FILTER_METAFIELD_NAMESPACE || 'custom' }}
+          FILTER_METAFIELD_KEY: ${{ vars.FILTER_METAFIELD_KEY || 'wisdomguild' }}
+          ITEMCODE_SOURCE: ${{ vars.ITEMCODE_SOURCE || 'variant_sku' }}
+          ITEMCODE_METAFIELD_NAMESPACE: ${{ vars.ITEMCODE_METAFIELD_NAMESPACE || 'custom' }}
+          ITEMCODE_METAFIELD_KEY: ${{ vars.ITEMCODE_METAFIELD_KEY || 'itemcode' }}
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./output
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

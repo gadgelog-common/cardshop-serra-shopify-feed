@@ -1,0 +1,13 @@
+{
+  "name": "cardshop-serra-shopify-feed",
+  "version": "1.0.0",
+  "description": "Wisdom Guild feed generator for Shopify",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "node scripts/generate-feed.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

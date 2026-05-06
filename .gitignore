@@ -1,0 +1,14 @@
+node_modules/
+output/
+.env
+
+# 生成済みフィード（GitHub Pages デプロイ時に Actions が生成）
+wisdom_guild_products.txt
+*.tmp
+
+# ローカル検証用のエクスポートデータ
+inventory_export.csv
+
+# エディタ等が作る一時ファイル
+Untitled
+.DS_Store
